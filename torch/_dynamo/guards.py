@@ -2961,7 +2961,10 @@ class GuardBuilder(GuardBuilderBase):
         ):
             obj_ref = weakref.ref(guarded_object)
 
-        if self.check_fn_manager.output_graph.export:
+        if (
+            self.check_fn_manager.output_graph is not None
+            and self.check_fn_manager.output_graph.export
+        ):
             guard.set_export_info(
                 func_name,
                 guarded_object_type,
