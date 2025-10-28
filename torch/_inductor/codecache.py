@@ -1680,9 +1680,9 @@ class CudaKernelParamCache:
         basename, _ = get_name_and_dir_from_output_file_path(bin_path)
 
         if config.aot_inductor.emit_multi_arch_kernel:
-            bin_type_to_ext = {"cubin": ".fatbin", "spv": ".spv"}
+            bin_type_to_ext = {"cubin": ".fatbin", "spv": ".spv", "hsaco": ".hsaco"}
             assert bin_type in bin_type_to_ext.keys(), (
-                "multi_arch_kernel_binary only supported in CUDA/XPU"
+                "multi_arch_kernel_binary only supported in CUDA/XPU/ROCm"
             )
             base_path, _ = os.path.splitext(bin_path)
             bin_path = base_path + bin_type_to_ext[bin_type]
@@ -1692,18 +1692,26 @@ class CudaKernelParamCache:
             config.aot_inductor.emit_multi_arch_kernel
             or config.aot_inductor.package_cpp_only
         ):
-            assert asm, "Missing kernel assembly code"
-            assert asm_type, "Missing kernel assembly type"
-            _, asm_path = write(
-                asm,
-                asm_type,
-                hash_type=asm_type,
-                specified_dir=split_aot_inductor_output_path(
-                    config.aot_inductor.output_path
-                )[0],
-                # make sure asm file has the same basename
-                key=basename,
-            )
+            # CUDA/XPU: require 'asm' (PTX/SPV). ROCm: allow proceeding without 'asm'
+            # and defaults to using the binary file provided by triton
+            if torch.version.hip is None or (asm and asm_type):
+                assert asm, "Missing kernel assembly code"
+                assert asm_type, "Missing kernel assembly type"
+
+                # Hashing only recognizes {"amdgcn","ptx","spv"}.
+                # For other text types (e.g., "ll", "bc"), fall back to "code".
+                hash_kind = asm_type if asm_type in {"amdgcn", "ptx", "spv"} else "code"
+
+                _, asm_path = write(
+                    asm,
+                    asm_type,
+                    hash_type=hash_kind,
+                    specified_dir=split_aot_inductor_output_path(
+                        config.aot_inductor.output_path
+                    )[0],
+                    # make sure asm file has the same basename
+                    key=basename,
+                )
 
         params[get_cpp_wrapper_cubin_path_name()] = bin_path
         params["asm"] = asm_path
@@ -2358,6 +2366,7 @@ end
                     if (
                         config.aot_inductor.emit_multi_arch_kernel
                         and device_type == "cuda"
+                        and torch.version.hip is None
                     ):
                         current_arch = _nvcc_arch_as_compile_option()
                         cmd = (
@@ -2380,6 +2389,15 @@ end
                                 file=sys.stderr,
                             )
                             raise
+
+                    elif (
+                        config.aot_inductor.emit_multi_arch_kernel
+                        and device_type == "cuda"
+                        and torch.version.hip is not None
+                    ):
+                        # ROCm: There is no fatbin analog; we deliberately do nothing here.
+                        # Triton already produced HSACO. We will just embed that HSACO below.
+                        pass
 
                     if config.aot_inductor.embed_kernel_binary:
                         # Embed cubin files into model.so using objcopy
@@ -2446,10 +2464,17 @@ end
                     generated_files.append(consts_o)
                     so_builder.save_src_to_cmake(cmake_path, consts_o)
 
-                if config.aot_inductor.emit_multi_arch_kernel:
+                # ROCm: DO NOT recompile asm in CMake
+                # CUDA multi-arch -> embed_gpu_kernel()
+                if (
+                    config.aot_inductor.emit_multi_arch_kernel
+                    and torch.version.hip is None
+                ):
                     so_builder.save_kernel_asm_to_cmake(cmake_path, asm_files)
                     generated_files.extend(asm_files)
-                else:
+
+                # ROCm -> just link prebuilt objects
+                elif torch.version.hip is not None:
                     obj_srcs = [*gpu_kernels_o, *cubins_o]
                     generated_files.extend(obj_srcs)
                     for obj in obj_srcs:

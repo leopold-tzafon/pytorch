@@ -320,10 +320,9 @@ class TestAOTInductorPackage(TestCase):
                 self.assertTrue(torch.allclose(actual, expected))
 
     @unittest.skipIf(
-        _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
+        torch.version.hip is None and _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
     )
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
-    @skipIfRocm  # doesn't support multi-arch binary
     @skipIfXpu  # doesn't support multi-arch binary
     def test_compile_after_package_multi_arch(self):
         if self.device != GPU_TYPE:
@@ -462,10 +461,9 @@ class TestAOTInductorPackage(TestCase):
                 self.assertTrue(a_path.exists())
 
     @unittest.skipIf(
-        _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
+        torch.version.hip is None and _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
     )
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
-    @skipIfRocm  # doesn't support multi-arch binary
     @skipIfXpu  # doesn't support multi-arch binary
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
     def test_compile_with_exporter(self):
@@ -520,10 +518,9 @@ class TestAOTInductorPackage(TestCase):
                         )
 
     @unittest.skipIf(
-        _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
+        torch.version.hip is None and _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
     )
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
-    @skipIfRocm  # doesn't support multi-arch binary
     @skipIfXpu  # doesn't support multi-arch binary
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
     def test_compile_with_exporter_weights(self):

@@ -238,12 +238,11 @@ class AOTInductorTestsTemplate:
         "toolchain doesn't support ptx to fatbin",
     )
     @skipIfMPS
-    @skipIfRocm
     # Skip embed_kernel_binary == True for now as it shows random
     # failure on CI
     @common_utils.parametrize("embed_kernel_binary", [False])
     @unittest.skipIf(
-        _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
+            torch.version.hip is None and _get_torch_cuda_version() < (12, 6), "Test is only supported on CUDA 12.6+"
     )
     def test_simple_multi_arch(self, embed_kernel_binary):
         if self.device != GPU_TYPE:
@@ -273,7 +272,14 @@ class AOTInductorTestsTemplate:
                 _, code = run_and_get_cpp_code(
                     AOTIRunnerUtil.compile, model, example_inputs
                 )
-                file_extension = ".spv" if self.device == "xpu" else ".fatbin"
+                file_extension = ""
+                if self.device == "xpu":
+                    file_extension = ".spv" 
+                elif self.device == "cuda" and torch.version.hip is not None:
+                    file_extension = ".hsaco"
+                else:
+                    file_extension = ".fatbin"
+
                 FileCheck().check(file_extension).run(code)
 
     def test_small_constant(self):

@@ -13,6 +13,7 @@ def _get_main_cpp_file(
     model_names: list[str],
     cuda: bool,
     example_inputs_map: typing.Optional[dict[str, int]],
+    is_hip: bool = False
 ) -> str:
     """
     Generates a main.cpp file for AOTInductor standalone models in the specified package.
@@ -42,7 +43,7 @@ def _get_main_cpp_file(
             "#include <torch/csrc/inductor/aoti_torch/tensor_converter.h>",
         ]
     )
-    if cuda:
+    if cuda and not is_hip:
         ib.writelines(
             [
                 "#include <cuda.h>",
@@ -181,7 +182,7 @@ def _get_main_cpp_file(
     return ib.getvalue()
 
 
-def _get_make_file(package_name: str, model_names: list[str], cuda: bool) -> str:
+def _get_make_file(package_name: str, model_names: list[str], cuda: bool, is_hip: bool = False) -> str:
     ib = IndentedBuffer()
 
     ib.writelines(
@@ -199,7 +200,7 @@ def _get_make_file(package_name: str, model_names: list[str], cuda: bool) -> str
     if test_configs.use_libtorch:
         ib.writeline("find_package(Torch REQUIRED)")
 
-    if cuda:
+    if cuda and not is_hip:
         ib.writeline("find_package(CUDA REQUIRED)")
 
     ib.newline()
@@ -207,13 +208,13 @@ def _get_make_file(package_name: str, model_names: list[str], cuda: bool) -> str
         ib.writeline(f"add_subdirectory({package_name}/data/aotinductor/{model_name}/)")
 
     ib.writeline("\nadd_executable(main main.cpp)")
-    if cuda:
+    if cuda and not is_hip:
         ib.writeline("target_compile_definitions(main PRIVATE USE_CUDA)")
 
     model_libs = " ".join(model_names)
     ib.writeline(f"target_link_libraries(main PRIVATE torch {model_libs})")
 
-    if cuda:
+    if cuda and not is_hip:
         ib.writeline("target_link_libraries(main PRIVATE cuda ${CUDA_LIBRARIES})")
 
     return ib.getvalue()
