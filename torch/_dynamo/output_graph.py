@@ -2301,7 +2301,8 @@ class OutputGraph(OutputGraphCommon):
                 # This is safe because we pre-process name to be unique
                 self.install_global_unsafe(name, compiled_fn)
 
-            # cleanup old_fake_mode to release weakrefs
+            # Cleanup old_fake_mode to release weakrefs
+            # Export uses this fake mode again, so don't clear if export
             if not self.export:
                 old_fake_mode._clear_memos()
 

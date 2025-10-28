@@ -2961,6 +2961,7 @@ class GuardBuilder(GuardBuilderBase):
         ):
             obj_ref = weakref.ref(guarded_object)
 
+        # set_export_info adds weakrefs, so avoid if not in export
         if (
             self.check_fn_manager.output_graph is not None
             and self.check_fn_manager.output_graph.export
