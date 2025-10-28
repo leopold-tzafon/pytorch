@@ -1,11 +1,12 @@
 # mypy: allow-untyped-defs
 import contextlib
 import functools
+import inspect
 import warnings
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional, overload, Protocol, Union
+from typing import Any, cast, Optional, overload, Protocol, Union
 from typing_extensions import TypeIs
 
 import torch
@@ -42,6 +43,23 @@ def is_in_torch_dispatch_mode(include_infra_modes: bool = True) -> bool:
 
 def is_in_any_mode_without_ignore_compile_internals() -> bool:
     return _is_in_any_mode_without_ignore_compile_internals
+
+
+def any_torch_dispatch_mode_on_stack() -> bool:
+    stack_len = torch._C._len_torch_dispatch_stack()
+
+    for idx in range(stack_len):
+        mode = _get_dispatch_stack_at(idx)
+
+        # Apply filters first
+        if mode.is_infra_mode():
+            continue
+
+        if mode.ignore_compile_internals():
+            continue
+
+        return True
+    return False
 
 
 class TorchDispatchMode:
@@ -106,6 +124,23 @@ class TorchDispatchMode:
                 bool
             ] = deque()
 
+    def __init_subclass__(cls, **kwargs):
+        """
+        Automatically wrap __torch_dispatch__ with recursive dynamo disable for all subclasses.
+        This ensures that compilation is disabled within dispatch modes and any functions
+        they call.
+        """
+        super().__init_subclass__(**kwargs)
+
+        # Check if the subclass defines its own __torch_dispatch__
+        if "__torch_dispatch__" in cls.__dict__:
+            raw = inspect.getattr_static(cls, "__torch_dispatch__")
+            # _disable doesn't work on classmethods. This later fails in runtime anyways
+            if not isinstance(raw, classmethod):
+                wrapped = torch._disable_dynamo(raw, recursive=True)
+                cast(Any, cls).__torch_dispatch__ = wrapped
+
+    @torch._disable_dynamo
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         raise NotImplementedError
 
