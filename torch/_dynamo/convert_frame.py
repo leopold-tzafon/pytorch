@@ -230,11 +230,14 @@ initial_global_state: Optional[GlobalStateGuard] = None
 
 @functools.wraps(original_forward_from_src)
 def fx_forward_from_src_skip_result(
-    src: str, globals: dict[str, Any], co_fields: Optional[dict[str, str]] = None
+    src: str,
+    globals: dict[str, Any],
+    co_fields: Optional[dict[str, str]] = None,
+    filename: Optional[str] = None,
 ) -> FunctionType:
     # we monkey patch FX to prevent infinite loop of trying to convert
     # our generated code
-    result = original_forward_from_src(src, globals, co_fields)
+    result = original_forward_from_src(src, globals, co_fields, filename)
     skip_code(result.__code__)
     return result
 

@@ -1,6 +1,8 @@
 # mypy: allow-untyped-defs
+import base64
 import contextlib
 import copy
+import hashlib
 import itertools
 import linecache
 import os
@@ -10,6 +12,7 @@ import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional, Union
+import tempfile
 
 import torch
 import torch.nn as nn
@@ -36,6 +39,7 @@ __all__ = [
 ]
 
 _USER_PRESERVED_ATTRIBUTES_KEY = "_user_preserved_attributes"
+FX_GRAPH_MODULE_FILE_PREFIX = "fx_generated_"
 
 
 # Normal exec loses the source code, however we can work with
@@ -91,23 +95,37 @@ class _EvalCacheLoader:
 _loader = _EvalCacheLoader()
 
 
-def _exec_with_source(src: str, globals: dict[str, Any], co_fields=None):
-    key = _loader.cache(src, globals, co_fields)
-    exec(compile(src, key, "exec"), globals)
+def _exec_with_source(src: str, globals: dict[str, Any], co_fields=None, filename=None):
+    if filename is not None:
+        # When filename is provided, use it directly for compilation
+        # This allows stack traces to reference the real file
+        key = filename
+        globals_copy = globals.copy()
+        globals_copy["__file__"] = key
+        globals_copy["__name__"] = key
+        linecache.lazycache(key, globals_copy)
+        exec(compile(src, key, "exec"), globals)
+    else:
+        key = _loader.cache(src, globals, co_fields)
+        exec(compile(src, key, "exec"), globals)
 
 
-def _forward_from_src(src: str, globals: dict[str, Any], co_fields=None):
+def _forward_from_src(src: str, globals: dict[str, Any], co_fields=None, filename=None):
     return _method_from_src(
-        method_name="forward", src=src, globals=globals, co_fields=co_fields
+        method_name="forward",
+        src=src,
+        globals=globals,
+        co_fields=co_fields,
+        filename=filename,
     )
 
 
 def _method_from_src(
-    method_name: str, src: str, globals: dict[str, Any], co_fields=None
+    method_name: str, src: str, globals: dict[str, Any], co_fields=None, filename=None
 ) -> Callable:
     # avoid mutating the passed in dict
     globals_copy = globals.copy()
-    _exec_with_source(src, globals_copy, co_fields)
+    _exec_with_source(src, globals_copy, co_fields, filename)
     fn = globals_copy[method_name]
     del globals_copy[method_name]
     return fn
@@ -351,6 +369,36 @@ def _print_readable(
     if print_output:
         print(module_code + submodule_code)
     return output
+
+
+def _metadata_hash(code: str, node_metadata: dict) -> str:
+    """
+    Create a content-addressed hash from code and metadata.
+
+    Args:
+        code: The source code string
+        lineno_map: Mapping from line numbers to node indices
+        node_metadata: Metadata for each node
+
+    Returns:
+        A 51-character base32-encoded hash
+    """
+    import json
+
+    # Create a deterministic string representation of all components
+    # We use JSON to ensure consistent serialization
+    hash_data = {
+        "code": code,
+        "node_metadata": node_metadata,
+    }
+    hashing_str = json.dumps(hash_data).encode("utf-8")
+
+    # [:51] to strip off the "Q====" suffix common to every hash value.
+    return (
+        base64.b32encode(hashlib.sha256(hashing_str).digest())[:51]
+        .decode("utf-8")
+        .lower()
+    )
 
 
 class _WrappedCall:
@@ -825,10 +873,50 @@ class {module_name}(torch.nn.Module):
         python_code = self._graph.python_code(root_module="self")
         self._code = python_code.src
         self._lineno_map = python_code._lineno_map
+        self._prologue_start = python_code._prologue_start
 
         cls = type(self)
         co_fields = self._graph._co_fields if hasattr(self._graph, "_co_fields") else {}
-        cls.forward = _forward_from_src(self._code, python_code.globals, co_fields)
+
+        node_metadata: dict[int, dict[str, Any]] = {}
+        for i, node in enumerate(self._graph.nodes):
+            node_metadata[i] = {
+                "name": node.name,
+                "op": node.op,
+                "target": str(node.target),
+                "stack_trace": node.meta.get("stack_trace", None),
+            }
+
+        # Generate a content-addressed filename based on hash of code and metadata
+        # This ensures the same code+metadata always generates the same filename
+        hash_value = _metadata_hash(self._code, node_metadata)
+        file_stem = f"{FX_GRAPH_MODULE_FILE_PREFIX}_{hash_value}"
+
+        # Have to write the file to the graph module to be jit.scriptable
+        graph_dir = tempfile.gettempdir()
+        os.makedirs(graph_dir, exist_ok=True)
+        filename = os.path.join(graph_dir, f"{file_stem}.py")
+        if not os.path.exists(filename):
+            # Save the generated code to file
+            with open(filename, "w") as f:
+                f.write(self._code)
+
+        # Store metadata in global in-memory registry
+        metadata = {
+            "lineno_map": python_code._lineno_map,
+            "prologue_start": python_code._prologue_start,
+            "node_metadata": node_metadata,
+        }
+
+        # Import and register metadata in the global registry
+        from torch.fx.traceback import register_fx_metadata
+
+        register_fx_metadata(filename, metadata)
+
+        # Use filename as filename (doesn't need to exist on disk)
+        cls.forward = _forward_from_src(
+            self._code, python_code.globals, co_fields, filename=filename
+        )
 
         # Determine whether this class explicitly defines a __call__ implementation
         # to wrap. If it does, save it in order to have wrapped_call invoke it.
