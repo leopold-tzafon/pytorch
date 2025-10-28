@@ -114,12 +114,8 @@ class ProfilingMode(Enum):
     PROFILING = 3
 
 # Set by parse_cmd_line_args() if called
-<<<<<<< Updated upstream
 CI_FUNCTORCH_ROOT = ""
 CI_PT_ROOT = ""
-CI_TEST_PREFIX = ""
-=======
->>>>>>> Stashed changes
 DISABLED_TESTS_FILE = ""
 GRAPH_EXECUTOR : Optional[ProfilingMode] = None
 LOG_SUFFIX = ""
