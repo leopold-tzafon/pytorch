@@ -796,6 +796,9 @@ static Tensor make_tensor_for_subclass_helper(
   return tensor;
 }
 
+static py::handle get_dtensor_class();
+static bool checked_issubclass(PyObject* cls, PyObject* cls2);
+
 static PyObject* THPVariable_make_wrapper_subclass(
     PyObject* /*unused*/,
     PyObject* args,
@@ -844,12 +847,22 @@ static PyObject* THPVariable_make_wrapper_subclass(
   // TODO: This check is not complete; because the user can disable torch
   // dispatch and then go again, triggering segfault.  TBH I'm thinking I want
   // to delete this function entirely
-  py::object attr = PyObject_FastGetAttrString(cls, "__torch_dispatch__");
-  TORCH_CHECK_TYPE(
-      attr.ptr() != nullptr &&
-          attr.ptr() != torch::disabled_torch_dispatch_impl(),
-      ((PyTypeObject*)cls)->tp_name,
-      " must define __torch_dispatch__");
+
+  // We check for DTensor specifically because unpickling a DTensor
+  // goes through this path, and DTensor does not have
+  // __torch_dispatch__.
+
+  const auto dtensor = get_dtensor_class();
+  const bool is_dtensor =
+      cls == dtensor.ptr() || checked_issubclass(cls, dtensor.ptr());
+  if (!is_dtensor) {
+    py::object attr = PyObject_FastGetAttrString(cls, "__torch_dispatch__");
+    TORCH_CHECK_TYPE(
+        attr.ptr() != nullptr &&
+            attr.ptr() != torch::disabled_torch_dispatch_impl(),
+        ((PyTypeObject*)cls)->tp_name,
+        " must define __torch_dispatch__");
+  }
 
   const auto options = TensorOptions()
                            .dtype(r.scalartype(5))
@@ -865,13 +878,19 @@ static PyObject* THPVariable_make_wrapper_subclass(
   // data
   auto sym_sizes = r.symintlist(1);
   auto sym_strides_own = r.symintlistOptional(2);
+  std::optional<DispatchKeySet> extra_dispatch_keys =
+      r.toDispatchKeySetOptional(13);
+  if (is_dtensor) {
+    extra_dispatch_keys = extra_dispatch_keys.value_or(DispatchKeySet())
+                              .add(c10::DispatchKey::DTensor);
+  }
   Tensor tensor = make_tensor_for_subclass_helper(
       /*sym_sizes=*/r.symintlist(1),
       /*sym_strides=*/r.symintlistOptional(2),
       /*sym_storage_offset=*/r.toSymIntOptional(3),
       options,
       /*storage_size=*/r.toSymIntOptional(14),
-      r.toDispatchKeySetOptional(13));
+      extra_dispatch_keys);
 
   const auto sizes_strides_policy = r.stringViewOptional(10);
   if (sizes_strides_policy.has_value()) {
@@ -894,33 +913,60 @@ static PyObject* THPVariable_make_wrapper_subclass(
       // false is the default
       /*allow_preexisting_pyobj=*/false,
       // we checked __torch_dispatch__ above; avoid checking again.
-      /*has_torch_dispatch_if_known=*/true);
+      /*has_torch_dispatch_if_known=*/!is_dtensor);
   END_HANDLE_TH_ERRORS
 }
 
-static py::handle get_dtensor_spec_class() {
 #if IS_PYBIND_2_13_PLUS
-  PYBIND11_CONSTINIT static py::gil_safe_call_once_and_store<py::object>
-      storage;
-  return storage
-      .call_once_and_store_result([]() -> py::object {
-        return py::module::import("torch")
-            .attr("distributed")
-            .attr("tensor")
-            .attr("_dtensor_spec")
-            .attr("DTensorSpec");
-      })
-      .get_stored();
+#define DEFINE_CACHING_PYTHON_IMPORT_GETTER(name, import_expr)             \
+  static py::handle name() {                                               \
+    PYBIND11_CONSTINIT static py::gil_safe_call_once_and_store<py::object> \
+        storage;                                                           \
+    return storage                                                         \
+        .call_once_and_store_result(                                       \
+            []() -> py::object { return import_expr; })                    \
+        .get_stored();                                                     \
+  }
 #else
-  static py::handle dtensor_spec_class = py::object(py::module::import("torch")
-                                                        .attr("distributed")
-                                                        .attr("tensor")
-                                                        .attr("_dtensor_spec")
-                                                        .attr("DTensorSpec"))
-                                             .release();
-  return dtensor_spec_class;
+#define DEFINE_CACHING_PYTHON_IMPORT_GETTER(name, import_expr)     \
+  static py::handle name() {                                       \
+    static py::handle storage = py::object(import_expr).release(); \
+    return storage;                                                \
+  }
 #endif
-}
+
+DEFINE_CACHING_PYTHON_IMPORT_GETTER(
+    get_dtensor_class,
+    py::module::import("torch")
+        .attr("distributed")
+        .attr("tensor")
+        .attr("DTensor"))
+
+DEFINE_CACHING_PYTHON_IMPORT_GETTER(
+    get_dtensor_spec_class,
+    py::module::import("torch")
+        .attr("distributed")
+        .attr("tensor")
+        .attr("_dtensor_spec")
+        .attr("DTensorSpec"))
+
+DEFINE_CACHING_PYTHON_IMPORT_GETTER(
+    get_dtensor_custom_op_handler,
+    py::module::import("torch")
+        .attr("distributed")
+        .attr("tensor")
+        .attr("DTensor")
+        .attr("_op_dispatcher")
+        .attr("custom_op_handler"))
+
+DEFINE_CACHING_PYTHON_IMPORT_GETTER(
+    get_dtensor_dispatch,
+    py::module::import("torch")
+        .attr("distributed")
+        .attr("tensor")
+        .attr("DTensor")
+        .attr("_op_dispatcher")
+        .attr("dispatch"))
 
 static bool arg_type_tensor_or_tensor_list_like(py::handle arg) {
   const auto dtensor_spec_class = get_dtensor_spec_class();
@@ -982,12 +1028,42 @@ static bool intern_dtensor_strings() {
   return true;
 }
 
+static bool checked_issubclass(PyObject* cls, PyObject* cls2) {
+  int result = PyObject_IsSubclass(cls, cls2);
+  if (result == -1) {
+    throw py::error_already_set();
+  }
+  return result;
+}
+
 static bool checked_not(PyObject* obj) {
   int result = PyObject_Not(obj);
   if (result == -1) {
     throw py::error_already_set();
   }
   return result;
+}
+
+// pybind11 does not not use PyObject_Vectorcall currently; it seems
+// to materialize a tuple of args instead.
+template <std::size_t N>
+static py::object checked_vectorcall(
+    PyObject* obj,
+    std::array<PyObject*, N> args) {
+  PyObject* result = PyObject_Vectorcall(obj, args.data(), N, nullptr);
+  if (!result) {
+    throw py::error_already_set();
+  }
+  return py::reinterpret_steal<py::object>(result);
+}
+
+template <typename... Args>
+static py::object checked_vectorcall(PyObject* obj, Args... args) {
+  static_assert(
+      (std::is_same_v<Args, PyObject*> && ...),
+      "must pass PyObject* to checked_vectorcall!");
+  std::array<PyObject*, sizeof...(Args)> arr = {args...};
+  return checked_vectorcall(obj, arr);
 }
 
 static c10::SymDimVector tuple_to_symintlist(PyObject* obj) {
@@ -1010,6 +1086,46 @@ static c10::SymDimVector tuple_to_symintlist(PyObject* obj) {
   return res;
 }
 
+// This is much simpler than the __torch_function__ paths precisely
+// because it doesn't have to worry about anything to do with dispatch
+// or __torch_function__.
+void callDTensorCustomOpHandler(
+    const c10::OperatorHandle& op,
+    torch::jit::Stack* stack) {
+  // We're called from dispatch and the dispatcher drops the GIL.
+  py::gil_scoped_acquire guard;
+  const auto op_handler = get_dtensor_custom_op_handler();
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+      op.schema().arguments().size() == stack->size());
+  auto [args, kwargs] = parseIValuesToPyArgsKwargs(op, *stack);
+  auto result = checked_vectorcall(
+      op_handler.ptr(),
+      torch::detail::getTorchApiFunction(op).ptr(),
+      args.ptr(),
+      kwargs.ptr());
+  stack->clear();
+  pushPyOutToStack(op, stack, std::move(result), "DTensor custom op handler");
+}
+
+void callDTensorOpDispatch(
+    const c10::OperatorHandle& op,
+    torch::jit::Stack* stack) {
+  // We're called from dispatch and the dispatcher drops the GIL.
+  py::gil_scoped_acquire guard;
+  const auto dispatch = get_dtensor_dispatch();
+  auto [args, kwargs] = parseIValuesToPyArgsKwargs(op, *stack);
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(
+      !kwargs.is_none(),
+      "Python op_dispatch implementation expects non-None kwargs");
+  auto result = checked_vectorcall(
+      dispatch.ptr(),
+      torch::detail::getTorchApiFunction(op).ptr(),
+      args.ptr(),
+      kwargs.ptr());
+  stack->clear();
+  pushPyOutToStack(op, stack, std::move(result), "DTensor op dispatch");
+}
+
 // DTensor-specific variant of make_wrapper_subclass to minimize DTensor
 // overhead.
 static PyObject* THPVariable_dtensor_new(
@@ -1029,18 +1145,6 @@ static PyObject* THPVariable_dtensor_new(
       "cls must be a type (got ",
       Py_TYPE(cls)->tp_name,
       ")");
-
-#ifndef NDEBUG
-  // This is specifically for making a DTensor, which we know defines
-  // __torch_dispatch__. Check anyway in debug builds in case somebody
-  // removes it.
-  py::object attr = PyObject_FastGetAttrString(cls, "__torch_dispatch__");
-  TORCH_CHECK_TYPE(
-      attr.ptr() != nullptr &&
-          attr.ptr() != torch::disabled_torch_dispatch_impl(),
-      ((PyTypeObject*)cls)->tp_name,
-      " must define __torch_dispatch__");
-#endif
 
   const auto& local_tensor = r.tensor(1);
   const bool requires_grad = r.toBool(3);
@@ -1087,8 +1191,8 @@ static PyObject* THPVariable_dtensor_new(
           tensor,
           // false is the default
           /*allow_preexisting_pyobj=*/false,
-          // we know DTensor has __torch_dispatch__; avoid checking again.
-          /*has_torch_dispatch_if_known=*/true));
+          // we know DTensor does not have __torch_dispatch__; avoid checking.
+          /*has_torch_dispatch_if_known=*/false));
   py_tensor.attr(dtensor_interned_strings._spec) = spec;
   py_tensor.attr(dtensor_interned_strings._local_tensor) = local_tensor;
   return py_tensor.release().ptr();
