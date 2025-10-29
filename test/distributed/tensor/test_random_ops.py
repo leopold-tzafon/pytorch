@@ -26,6 +26,7 @@ from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed._tensor.common_dtensor import (
+    create_local_tensor_test_class,
     DTensorTestBase,
     skip_if_lt_x_gpu,
     skip_unless_torch_gpu,
@@ -657,6 +658,14 @@ class DistTensorRandomOpsTest3D(DTensorTestBase):
                     weight_gather[other_rank_dim_0_start:other_rank_dim_0_end, :],
                 )
 
+
+DistTensorRandomInitTestWithLocalTensor = create_local_tensor_test_class(
+    DistTensorRandomInitTest,
+)
+
+DistTensorRandomOpsTest3DWithLocalTensor = create_local_tensor_test_class(
+    DistTensorRandomOpsTest3D,
+)
 
 if __name__ == "__main__":
     run_tests()

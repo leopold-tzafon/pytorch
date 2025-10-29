@@ -730,7 +730,14 @@ class LocalDTensorTestBase(DTensorTestBase):
 
     @property
     def rank(self):
-        return torch.SymInt(LocalIntNode({r: r for r in range(self.world_size)}))
+        from torch.distributed._local_tensor import _current_rank
+
+        current_rank = getattr(_current_rank, "rank", None)
+
+        if current_rank is not None:
+            return current_rank
+        else:
+            return torch.SymInt(LocalIntNode({r: r for r in range(self.world_size)}))
 
     @rank.setter
     def rank(self, rank):

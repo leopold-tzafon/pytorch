@@ -47,6 +47,7 @@ import functools
 import operator
 import os
 import sys
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
 from types import TracebackType
@@ -77,6 +78,8 @@ from torch.utils.checkpoint import get_device_states, set_device_states
 
 not_implemented_log = torch._logging.getArtifactLogger(__name__, "not_implemented")
 
+# Thread-local storage for tracking the current rank being simulated
+_current_rank: threading.local = threading.local()
 
 from . import _c10d
 
@@ -169,6 +172,54 @@ def _set_rng_state(
     _set_cuda_rng_states(cuda_states)
 
 
+def _get_device_from_local_tensors(flat_args: list[Any]) -> Optional[torch.device]:
+    for arg in flat_args:
+        if isinstance(arg, LocalTensor):
+            first_tensor = next(iter(arg._local_tensors.values()))
+            return first_tensor.device
+    return None
+
+
+def _is_random_op(func: Callable[..., Any]) -> bool:
+    from torch._ops import OpOverload
+    from torch.distributed.tensor._dispatch import OpDispatcher
+
+    if not isinstance(func, OpOverload):
+        return False
+    return func in OpDispatcher()._random_ops
+
+
+def _get_rng_offset_for_rank(rank: int) -> Optional[int]:
+    """
+    Calculate the RNG offset for a specific rank based on the current DTensorSpec.
+
+    This reuses the offset calculation logic from OffsetBasedRNGTracker to avoid duplication.
+    """
+    from torch.distributed.tensor import _random as random
+
+    spec = getattr(random._current_dtensor_spec, "spec", None)
+    if spec is None:
+        return None
+
+    # Check if the RNG tracker exists and has the helper method
+    if random._rng_tracker is None or not hasattr(
+        random._rng_tracker, "_compute_offset_for_shard"
+    ):
+        return None
+
+    # Convert rank to mesh coordinate
+    mesh = spec.mesh
+    mesh_shape = mesh.shape
+    mesh_coordinate = []
+    remaining_rank = rank
+    for mesh_dim_size in reversed(mesh_shape):
+        mesh_coordinate.insert(0, remaining_rank % mesh_dim_size)
+        remaining_rank //= mesh_dim_size
+
+    # Use the shared helper method from the RNG tracker
+    return random._rng_tracker._compute_offset_for_shard(spec, mesh_coordinate)
+
+
 def _combine_int_rank_results(rank_results: dict[int, int]) -> int | torch.SymInt:
     any_v = next(iter(rank_results.values()))
 
@@ -186,6 +237,9 @@ def _combine_any_rank_results(rank_results: dict[int, Any]) -> Any:
         return LocalTensor(rank_results)
 
     if isinstance(any_v, int):
+        return _combine_int_rank_results(rank_results)
+
+    if isinstance(any_v, (float, bool, complex)):
         return _combine_int_rank_results(rank_results)
 
     assert all(v == any_v for v in rank_results.values()), (
@@ -232,16 +286,50 @@ def _for_each_rank_run_func(
         a.wait() if isinstance(a, AsyncCollectiveTensor) else a for a in flat_args
     ]
 
-    # NB: Before invoking an op we are collecting rng states from CPU and
-    # CUDA devices such that we can reset to the same before invoking op
-    # for each rank. This is not very efficient and will likely be revisited
-    # to support per rank rng state.
-    rng_state = _get_rng_state()
-    flat_rank_rets = {}
+    is_random = _is_random_op(func)
+    base_rng_offset = None
 
+    rng_state = _get_rng_state()
+
+    if is_random:
+        from torch.distributed.tensor import _random as random
+
+        if (
+            hasattr(random._current_dtensor_spec, "spec")
+            and random._current_dtensor_spec.spec is not None
+        ):
+            device = _get_device_from_local_tensors(flat_args)
+            if device is not None and device.type in ("cuda", "xpu", "hpu"):
+                current_state = random.get_rng_state_for_device(device)
+                base_rng_offset = int(current_state[8:].view(dtype=torch.int64).item())
+
+    flat_rank_rets = {}
     default_value: Tensor | None = None
+
     for r in sorted(ranks):
+        _current_rank.rank = r
         _set_rng_state(*rng_state)
+
+        if base_rng_offset is not None:
+            rank_offset = _get_rng_offset_for_rank(r)
+            if rank_offset is not None:
+                try:
+                    device = _get_device_from_local_tensors(flat_args)
+                    if device is not None and device.type in ("cuda", "xpu", "hpu"):
+                        current_state = random.get_rng_state_for_device(device).to(
+                            "cpu"
+                        )
+
+                        new_offset = base_rng_offset + rank_offset
+                        offset_tensor = torch.tensor(
+                            [new_offset], dtype=torch.uint64, device="cpu"
+                        ).view(torch.uint8)
+                        current_state[8:] = offset_tensor
+
+                        random.set_rng_state_for_device(device, current_state)
+                except Exception:
+                    pass
+
         rank_flat_args = [_map_to_rank_local_val(a, r) for a in flat_args]
         rank_args, rank_kwargs = pytree.tree_unflatten(rank_flat_args, args_spec)
         rank_ret = func(*rank_args, **rank_kwargs)
@@ -398,6 +486,36 @@ class LocalIntNode:
 
     def wrap_int(self, num: int) -> "LocalIntNode | ConstantIntNode":
         return ConstantIntNode(num)
+
+    def guard_int(self, file: str, line: int) -> int:
+        current_rank = getattr(_current_rank, "rank", None)
+
+        if current_rank is not None:
+            r = self._local_ints[current_rank]
+        else:
+            unique_values = set(self._local_ints.values())
+            if len(unique_values) != 1:
+                raise AssertionError(
+                    f"Cannot guard LocalIntNode with divergent values across ranks outside of rank context: {self._local_ints}"
+                )
+            r = next(iter(unique_values))
+
+        try:
+            return int(r)
+        except Exception:
+            not_implemented_log.warning("Failed to convert to int: %s", r)
+            raise
+
+    def statically_known_true(self, file: str, line: int) -> bool:
+        current_rank = getattr(_current_rank, "rank", None)
+
+        if current_rank is not None:
+            return bool(self._local_ints[current_rank])
+        else:
+            unique_values = set(self._local_ints.values())
+            if len(unique_values) != 1:
+                return False
+            return bool(next(iter(unique_values)))
 
 
 class LocalTensor(torch.Tensor):
