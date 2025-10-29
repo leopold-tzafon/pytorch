@@ -265,8 +265,10 @@ def _private_register_pytree_node(
         )
 
 
-def _is_pytreespec_instance(obj: Any, /) -> TypeIs[TreeSpec]:
-    return isinstance(obj, TreeSpec)
+def _is_pytreespec_instance(
+    obj: Any, /
+) -> TypeIs[Union[TreeSpec, python_pytree.TreeSpec]]:
+    return isinstance(obj, (TreeSpec, python_pytree.TreeSpec))
 
 
 def treespec_leaf() -> TreeSpec:
@@ -972,7 +974,7 @@ def treespec_dumps(treespec: TreeSpec, protocol: Optional[int] = None) -> str:
     """Serialize a treespec to a JSON string."""
     if not _is_pytreespec_instance(treespec):
         raise TypeError(
-            f"treespec_dumps(treespec): Expected `treespec` to be instance of "
+            f"Expected `treespec` to be instance of "
             f"PyTreeSpec but got item of type {type(treespec)}."
         )
 
