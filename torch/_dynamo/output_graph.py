@@ -2303,6 +2303,7 @@ class OutputGraph(OutputGraphCommon):
 
             # Cleanup old_fake_mode to release weakrefs
             # Export uses this fake mode again, so don't clear if export
+            # TODO: If shouldn't be needed when torch._dynamo.export is cleaned up.
             if not self.export:
                 old_fake_mode._clear_memos()
 
