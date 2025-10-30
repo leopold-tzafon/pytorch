@@ -5,6 +5,7 @@ from typing import Any, Callable, Literal, Optional, TYPE_CHECKING, Union
 import torch
 import torch._inductor.custom_graph_pass
 from torch._environment import is_fbcode
+from torch._inductor.choices import InductorChoices
 from torch.utils._config_module import Config, get_tristate_env, install_config_module
 
 
@@ -652,6 +653,10 @@ implicit_fallbacks = True
 assume_unaligned_fallback_output = (
     os.environ.get("TORCHINDUCTOR_ASSUME_UNALIGNED_FALLBACK_OUTPUT") == "1"
 )
+
+# Custom InductorChoices class to use, a tuple of (class, kwargs)
+# Example: inductor_choices_class = (MyCustomChoices, {"arg1": value1})
+inductor_choices_class: Optional[tuple[type[InductorChoices], dict[str, Any]]] = None
 
 # fuse even in cases without common reads
 aggressive_fusion = False
