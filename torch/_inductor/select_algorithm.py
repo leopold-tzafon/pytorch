@@ -2700,6 +2700,7 @@ class AlgorithmSelectorCache(PersistentCache):
         precompilation_timeout_seconds: int = 60 * 60,
         return_multi_template=False,
         best_config_future=None,
+        return_choice=False,
     ):
         from .codegen.cuda.cuda_kernel import CUDATemplateCaller
 
@@ -2957,7 +2958,6 @@ class AlgorithmSelectorCache(PersistentCache):
             )
 
         timings = do_autotuning(choices, precompile_fn)
-
         # if timings is empty, we really have no choice but to return a semi-random
         # choice. returning the first `ExternKernelCaller` is probably the safest bet
         # in this case, since it will generally be the ATen kernel. if there are no
@@ -2972,18 +2972,25 @@ class AlgorithmSelectorCache(PersistentCache):
                         "Autotuning returned empty timings, falling back to first `ExternKernelCaller`: %s",
                         node,
                     )
+                    if return_choice:
+                        return node, choice
                     return node
             node = choices[0].output_node()
+            choice = choices[0]
             log.debug(
                 "Autotuning returned empty timings, falling back to first choice: %s",
                 node,
             )
+            if return_choice:
+                return node, choice
             return node
 
         # if we got any timings at all, pick the best of those
         choice = min(timings, key=timings.__getitem__)
         node = choice.output_node()
         log.debug("Autotuning selected choice: %s", node)
+        if return_choice:
+            return node, choice
         return node
 
     def make_precompile_fn(
@@ -3680,6 +3687,7 @@ class AlgorithmSelectorCache(PersistentCache):
         dtypes = ", ".join([str(n.get_dtype()) for n in input_nodes])
         if config.autotune_num_choices_displayed == 0:
             return
+
         # when autotune_num_choices_displayed is None, [:None] means all
         n = config.autotune_num_choices_displayed
         top_k = sorted(timings, key=timings.__getitem__)[:n]
