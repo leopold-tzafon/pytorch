@@ -633,6 +633,82 @@ class TestViewOps(DTensorTestBase):
                 self.assertEqual(len(comm_mode.get_comm_counts()), 0)
 
     @with_comms
+    def test_dtensor_flatten(self):
+        # 1D case
+        mesh = init_device_mesh(self.device_type, (self.world_size,))
+        batch_size, seq_len, dim = 6, 6, 3
+        global_inps = torch.arange(batch_size * seq_len * dim).view(batch_size, seq_len, dim)
+        inps = distribute_tensor(global_inps, mesh, (Shard(1), ))
+        inps_viewed = inps.view(batch_size * seq_len, dim)
+        expected_placements = (_StridedShard(dim=0, split_factor=6),)
+        self.assertEqual(inps_viewed.placements, expected_placements)
+
+        # 2D case: S1, S2
+        mesh = init_device_mesh(self.device_type, (self.world_size // 2, 2))
+        batch_size, seq_len, dim1, dim2 = 6, 6, 6, 3
+        global_inps = torch.arange(batch_size * seq_len * dim1 * dim2).view(
+            batch_size, seq_len, dim1, dim2
+        )
+        inps = distribute_tensor(global_inps, mesh, (Shard(1), Shard(2)))
+        inps_viewed = inps.view(batch_size * seq_len * dim1, dim2)
+        expected_placements = (
+            _StridedShard(dim=0, split_factor=6),
+            _StridedShard(dim=0, split_factor=12),
+        )
+        self.assertEqual(inps_viewed.placements, expected_placements)
+
+        # 2D case: R, S2
+        mesh = init_device_mesh(self.device_type, (self.world_size // 2, 2))
+        batch_size, seq_len, dim1, dim2 = 6, 6, 6, 3
+        global_inps = torch.arange(batch_size * seq_len * dim1 * dim2).view(
+            batch_size, seq_len, dim1, dim2
+        )
+        inps = distribute_tensor(global_inps, mesh, (Replicate(), Shard(2)))
+        inps_viewed = inps.view(batch_size * seq_len * dim1, dim2)
+        expected_placements = (
+            Replicate(),
+            _StridedShard(dim=0, split_factor=36),
+        )
+        self.assertEqual(inps_viewed.placements, expected_placements)
+
+
+    @with_comms
+    def test_dtensor_unflatten(self):
+        # 1D case
+        # mesh = init_device_mesh(self.device_type, (self.world_size,))
+        # batch_size, seq_len, dim = 6, 6, 3
+        # global_inps = torch.arange(batch_size * seq_len * dim).view(batch_size * seq_len, dim)
+        # inps = distribute_tensor(global_inps, mesh, (_StridedShard(0, split_factor=6), ))
+        # inps_viewed = inps.view(batch_size, seq_len, dim)
+        # expected_placements = (Shard(1),)
+        # self.assertEqual(inps_viewed.placements, expected_placements)
+
+        # # 2D case: S1, S2
+        mesh = init_device_mesh(self.device_type, (self.world_size // 2, 2))
+        batch_size, seq_len, dim1, dim2 = 6, 6, 6, 3
+        global_inps = torch.arange(batch_size * seq_len * dim1 * dim2).view(
+            batch_size * seq_len * dim1, dim2
+        )
+        inps = distribute_tensor(global_inps, mesh, (_StridedShard(dim=0, split_factor=6), _StridedShard(dim=0, split_factor=12)))
+        inps_viewed = inps.view(batch_size, seq_len, dim1, dim2)
+        expected_placements = (Shard(1), Shard(2))
+        self.assertEqual(inps_viewed.placements, expected_placements)
+
+        # # 2D case: R, S2
+        # mesh = init_device_mesh(self.device_type, (self.world_size // 2, 2))
+        # batch_size, seq_len, dim1, dim2 = 6, 6, 6, 3
+        # global_inps = torch.arange(batch_size * seq_len * dim1 * dim2).view(
+        #     batch_size, seq_len, dim1, dim2
+        # )
+        # inps = distribute_tensor(global_inps, mesh, (Replicate(), Shard(2)))
+        # inps_viewed = inps.view(batch_size * seq_len * dim1, dim2)
+        # expected_placements = (
+        #     Replicate(),
+        #     _StridedShard(dim=0, split_factor=36),
+        # )
+        # self.assertEqual(inps_viewed.placements, expected_placements)
+
+    @with_comms
     def test_view_redistribution(self):
         """
         This test is added to demonstrate "incorrect" view ops behavior if redistribution happens.
@@ -670,6 +746,7 @@ TestViewOpsWithLocalTensor = create_local_tensor_test_class(
     skipped_tests=[
         # Comparing data pointers is not supported for local tensor
         "test_dtensor_view_op_uneven",
+        "test_dtensor_flatten",
     ],
 )
 
